@@ -3,7 +3,7 @@ import json
 import base64
 import os
 
-ANTHROPIC_API_KEY = "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"
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 
 class AIExerciseAnalyzer:
     def __init__(self):
