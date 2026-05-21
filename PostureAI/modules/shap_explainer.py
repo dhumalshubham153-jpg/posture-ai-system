@@ -24,42 +24,66 @@ class ShapExplainer:
     ]
 
     def __init__(self, model):
-        self.model    = model
-        self.explainer= None
+        self.model     = model
+        self.explainer = None
         os.makedirs('reports', exist_ok=True)
 
     def setup(self, X_background=None):
         """Setup SHAP explainer with background data"""
         if X_background is None:
-            # Use synthetic background
             np.random.seed(42)
             X_background = np.array([
                 [10, 5,  165, 5,  10],
                 [20, 15, 140, 15, 30],
                 [35, 30, 110, 30, 60],
             ])
-        self.explainer = shap.TreeExplainer(self.model.model)
+        try:
+            self.explainer = shap.TreeExplainer(self.model.model)
+        except Exception as e:
+            print(f"SHAP setup error: {e}")
+            self.explainer = None
+
+    def _extract_vals(self, features):
+        vals = []
+        for feat in self.FEATURES:
+            v = features.get(feat)
+            vals.append(float(v) if v is not None else 0.0)
+        return vals
 
     def explain(self, features):
         """Get SHAP values for a single prediction"""
         if self.explainer is None:
             self.setup()
 
-        vals = []
-        for feat in self.FEATURES:
-            v = features.get(feat)
-            vals.append(float(v) if v is not None else 0.0)
+        vals = self._extract_vals(features)
+        X    = np.array([vals])
 
-        X          = np.array([vals])
-        shap_vals  = self.explainer.shap_values(X)
+        try:
+            shap_vals = self.explainer.shap_values(X)
 
-        # Handle multi-class
-        if isinstance(shap_vals, list):
-            # Use class with highest impact
-            shap_arr = np.array(shap_vals)
-            sv = shap_arr[:, 0, :].mean(axis=0)
-        else:
-            sv = shap_vals[0]
+            # Handle all possible shapes from TreeExplainer:
+            # - list of arrays (multi-class): shape is [n_classes][n_samples, n_features]
+            # - single 3D array: shape is [n_samples, n_features, n_classes]
+            # - single 2D array: shape is [n_samples, n_features]
+            if isinstance(shap_vals, list):
+                # Multi-class list: average absolute impact across classes
+                arrays = np.array(shap_vals)          # (n_classes, n_samples, n_features)
+                sv = arrays[:, 0, :].mean(axis=0)     # (n_features,)
+            elif isinstance(shap_vals, np.ndarray):
+                if shap_vals.ndim == 3:
+                    # (n_samples, n_features, n_classes)
+                    sv = shap_vals[0, :, :].mean(axis=1)
+                elif shap_vals.ndim == 2:
+                    # (n_samples, n_features)
+                    sv = shap_vals[0]
+                else:
+                    sv = shap_vals
+            else:
+                sv = np.zeros(len(self.FEATURES))
+
+        except Exception as e:
+            print(f"SHAP explain error: {e}")
+            sv = np.zeros(len(self.FEATURES))
 
         explanation = []
         for i, feat in enumerate(self.FEATURES):
@@ -70,7 +94,6 @@ class ShapExplainer:
                 'impact'    : 'increases risk' if sv[i] > 0 else 'decreases risk',
             })
 
-        # Sort by absolute impact
         explanation.sort(key=lambda x: abs(x['shap_value']), reverse=True)
         return explanation
 

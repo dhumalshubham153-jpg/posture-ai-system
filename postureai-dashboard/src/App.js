@@ -36,6 +36,9 @@ const painColor  = p => p<=3?"#00ff9d":p<=6?"#fbbf24":"#f87171";
 
 // ── Token helpers ─────────────────────────────────────────────────────────────
 const getToken = async () => {
+  // If no stored token at all, don't even try Supabase
+  const stored = localStorage.getItem("token");
+  if (!stored) return "";
   try {
     const { data } = await sb.auth.getSession();
     if (data?.session?.access_token) {
@@ -43,12 +46,27 @@ const getToken = async () => {
       return data.session.access_token;
     }
   } catch {}
-  return localStorage.getItem("token") || "";
+  return stored;
 };
 
 const apiCall = async (method, url, body = null) => {
   let token = await getToken();
-  const hdrs = () => ({ headers: { Authorization: `Bearer ${token}` } });
+
+  // Catch malformed token before it hits the backend
+  if (!token || token.split(".").length !== 3) {
+    try {
+      const { data } = await sb.auth.refreshSession();
+      token = data?.session?.access_token || "";
+      if (token) localStorage.setItem("token", token);
+    } catch {}
+  }
+
+  const hdrs = () => ({
+    headers: {
+      Authorization: `Bearer ${token}`,
+      "Content-Type": "application/json",
+    },
+  });
   const exec = async () => {
     if (method==="get")    return await axios.get(url, hdrs());
     if (method==="post")   return await axios.post(url, body, hdrs());
@@ -61,10 +79,12 @@ const apiCall = async (method, url, body = null) => {
     if (e.response?.status === 401) {
       try {
         const { data } = await sb.auth.refreshSession();
-        token = data?.session?.access_token || token;
-        localStorage.setItem("token", token);
+        token = data?.session?.access_token || "";
+        if (token) localStorage.setItem("token", token);
         return await exec();
-      } catch {}
+      } catch {
+        // Don't auto-reload — just let the request fail silently
+      }
     }
     throw e;
   }
@@ -987,6 +1007,7 @@ export default function App() {
   };
 
   useEffect(()=>{
+    if(!user) return;
     loadAll();loadPhysios();loadConsultations();loadSnapshots();loadPrescriptions();
     if(!isPhysio) loadDailyProgress();
     axios.post(`${API}/risk/as-risk`,demo).then(r=>setAsRisk(r.data)).catch(()=>{});
@@ -995,10 +1016,10 @@ export default function App() {
     axios.get(`${API}/report/exercises?features=${encodeURIComponent(JSON.stringify(demo))}`).then(r=>setExercises(r.data.exercises||[])).catch(()=>{});
     const i1=setInterval(loadAll,10000);
     const i2=setInterval(async()=>{ try{ const r=await axios.get(`${API}/camera/state`); setCamState(r.data); if(r.data.capture_done&&!captureComplete){setCaptureComplete(true);setTimeout(()=>{loadSnapshots();},3000);} }catch{} },1500);
-    const i3=setInterval(loadConsultations,5000);
+    const i3=setInterval(()=>{ if(localStorage.getItem("token")) loadConsultations(); },5000);
     const i4=setInterval(loadSnapshots,20000);
     return()=>{clearInterval(i1);clearInterval(i2);clearInterval(i3);clearInterval(i4);};
-  },[]);
+  },[user]);
 
   const handleLogin=d=>{setUser(d);localStorage.setItem("role",d.role);};
   const handleLogout=async()=>{stopCamera();await sb.auth.signOut();localStorage.clear();setUser(null);};
