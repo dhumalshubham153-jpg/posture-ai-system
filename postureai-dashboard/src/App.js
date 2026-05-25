@@ -36,16 +36,25 @@ const painColor  = p => p<=3?"#00ff9d":p<=6?"#fbbf24":"#f87171";
 
 // ── Token helpers ─────────────────────────────────────────────────────────────
 const getToken = async () => {
-  // If no stored token at all, don't even try Supabase
   const stored = localStorage.getItem("token");
   if (!stored) return "";
+
+  // Always try to get fresh session from Supabase first
   try {
     const { data } = await sb.auth.getSession();
     if (data?.session?.access_token) {
       localStorage.setItem("token", data.session.access_token);
       return data.session.access_token;
     }
+    // Session exists but no access token — try refresh
+    const { data: refreshed } = await sb.auth.refreshSession();
+    if (refreshed?.session?.access_token) {
+      localStorage.setItem("token", refreshed.session.access_token);
+      return refreshed.session.access_token;
+    }
   } catch {}
+
+  // Fallback to stored token
   return stored;
 };
 
@@ -67,24 +76,47 @@ const apiCall = async (method, url, body = null) => {
       "Content-Type": "application/json",
     },
   });
+
   const exec = async () => {
     if (method==="get")    return await axios.get(url, hdrs());
     if (method==="post")   return await axios.post(url, body, hdrs());
     if (method==="put")    return await axios.put(url, body, hdrs());
     if (method==="delete") return await axios.delete(url, hdrs());
   };
+
   try {
     return await exec();
   } catch(e) {
     if (e.response?.status === 401) {
+      // Token expired — try to refresh once
       try {
         const { data } = await sb.auth.refreshSession();
         token = data?.session?.access_token || "";
-        if (token) localStorage.setItem("token", token);
-        return await exec();
-      } catch {
-        // Don't auto-reload — just let the request fail silently
-      }
+        if (token) {
+          localStorage.setItem("token", token);
+          return await exec(); // retry with new token
+        }
+      } catch {}
+
+      // Refresh failed — try signInWithPassword using stored credentials
+      // If that also fails, clear session and redirect to login
+      try {
+        const email = localStorage.getItem("email");
+        const pass  = sessionStorage.getItem("pass"); // only if stored
+        if (email && pass) {
+          const { data } = await sb.auth.signInWithPassword({ email, password: pass });
+          token = data?.session?.access_token || "";
+          if (token) {
+            localStorage.setItem("token", token);
+            return await exec();
+          }
+        }
+      } catch {}
+
+      // Nothing worked — clear stale auth and force re-login
+      console.warn("401 persists after refresh — clearing session");
+      localStorage.removeItem("token");
+      // Don't clear everything — let user see the error, not a blank screen
     }
     throw e;
   }
@@ -139,6 +171,7 @@ function VoiceCamera({ camState }) {
     if(camState.voice_message) speak(camState.voice_message);
     if(camState.capture_flash&&!lastFlash.current) beep();
     lastFlash.current=camState.capture_flash;
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   },[camState?.voice_message,camState?.capture_flash]);
   return null;
 }
@@ -152,6 +185,7 @@ function ExerciseTimer({ exercise, onDone }) {
     speak(`Starting ${exercise.name||exercise.exercise}. Get ready.`);
     ref.current=setInterval(()=>setCount(c=>{if(c<=1){clearInterval(ref.current);setPhase("exercise");speak("Go!");return 0;}speak(String(c-1));return c-1;}),1000);
     return()=>clearInterval(ref.current);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   },[]);
   useEffect(()=>{
     if(phase!=="exercise") return;
@@ -163,6 +197,7 @@ function ExerciseTimer({ exercise, onDone }) {
         else{setPhase("done");speak("Exercise complete!");}
         return 0;} return t-1;}),1000);
     return()=>clearInterval(ref.current);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   },[phase,set,rep]);
   const hs=exercise.hold_secs||5, pct=holdT/hs;
   return (
@@ -216,12 +251,16 @@ function LoginPage({ onLogin }) {
       } else {
         const r=await axios.post(`${API}/auth/login`,{email,password:pass});
         if(r.data.success){
+          // Sign in on the Supabase client so session auto-refreshes
           await sb.auth.signInWithPassword({email,password:pass});
           localStorage.setItem("token",r.data.access_token);
           localStorage.setItem("user_id",r.data.user_id);
           localStorage.setItem("email",r.data.email);
           localStorage.setItem("name",r.data.name||"");
           localStorage.setItem("role",r.data.role||"user");
+          // Store pass temporarily in sessionStorage for emergency token refresh
+          // sessionStorage clears when the tab closes — safer than localStorage
+          sessionStorage.setItem("pass",pass);
           onLogin(r.data);
         }
       }
@@ -312,15 +351,13 @@ function AICard({ ex, onStart }) {
 function BigImage({ src, label, fallbackSrc }) {
   const [open,setOpen]=useState(false);
   const [imgSrc,setImgSrc]=useState(src);
-  const [tries,setTries]=useState(0);
-  useEffect(()=>{setImgSrc(src);setTries(0);},[src]);
+  const triesRef=useRef(0);
+  useEffect(()=>{setImgSrc(src);triesRef.current=0;},[src]);
   const onErr=()=>{
-    setTries(t=>{
-      const n=t+1;
-      if(n===1&&fallbackSrc) setImgSrc(fallbackSrc);
-      else if(n===2){ const nm=src.split('/').pop().split('\\').pop(); setImgSrc(`${API}/snapshots/view/${nm}`); }
-      return n;
-    });
+    triesRef.current+=1;
+    const n=triesRef.current;
+    if(n===1&&fallbackSrc) setImgSrc(fallbackSrc);
+    else if(n===2){ const nm=src.split('/').pop().split('\\').pop(); setImgSrc(`${API}/snapshots/view/${nm}`); }
   };
   return (
     <>
@@ -433,24 +470,100 @@ function NearbyDoctors() {
 }
 
 // ── Share Report Panel ────────────────────────────────────────────────────────
-function ShareReportPanel({ camState, consultations, snapshots }) {
+function ShareReportPanel({ camState, consultations, snapshots, patientName }) {
   const [sel,setSel]=useState(""),[sharing,setSharing]=useState(false),[status,setStatus]=useState("");
   const all=consultations.filter(c=>c.status==="active"||c.status==="pending");
+
+  const getSnapshotsInCaptureOrder=()=>{
+    const SIDE_ORDER=["FRONT","LEFT_SIDE","LEFT","RIGHT_SIDE","RIGHT"];
+    if(camState?.snapshot_urls?.length){
+      return camState.snapshot_urls.slice(0,3).map(s=>s.filename?`data/${s.filename}`:"").filter(Boolean);
+    }
+    return [...snapshots].sort((a,b)=>{
+      const nA=(a.filename||a.name||"").toUpperCase();
+      const nB=(b.filename||b.name||"").toUpperCase();
+      const iA=SIDE_ORDER.findIndex(k=>nA.includes(k));
+      const iB=SIDE_ORDER.findIndex(k=>nB.includes(k));
+      return (iA===-1?99:iA)-(iB===-1?99:iB);
+    }).slice(0,3).map(s=>`data/${s.filename||s.name}`).filter(Boolean);
+  };
+
   const share=async()=>{
     if(!sel){setStatus("Select a physiotherapist");return;}
     setSharing(true); setStatus("");
     try {
       const c=all.find(x=>x.id===sel);
+      const snapPaths=getSnapshotsInCaptureOrder();
+
+      // Generate PDF with patient name + today's date as filename
+      const today=new Date().toISOString().slice(0,10); // YYYY-MM-DD
+      const safeName=(patientName||"Patient").replace(/[^a-zA-Z0-9]/g,"_");
+      const pdfFilename=`${safeName}_${today}.pdf`;
+
+      // Generate PDF blob
+      const pdfRes=await axios.post(`${API}/report/generate-pdf`,{
+        features      : camState?.features||{},
+        result        : camState?.score||{},
+        risk          : camState?.risk||{},
+        snapshot_paths: snapPaths,
+        patient_name  : patientName||"Patient",
+        report_date   : today,
+      },{responseType:"blob"});
+
+      // Upload PDF to Supabase storage so physio can download it
+      const {createClient}=await import("@supabase/supabase-js");
+      const sbClient=createClient(
+        "https://xepdxusghwuzepyekbxk.supabase.co",
+        "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InhlcGR4dXNnaHd1emVweWVrYnhrIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc3MjQ2OTgsImV4cCI6MjA5MzMwMDY5OH0.zhtZLs9P2BWnbrIjighJTJoZPAxgyV_pLEz2aKAL_dU"
+      );
+      const pdfBlob=new Blob([pdfRes.data],{type:"application/pdf"});
+      let pdfPublicUrl="";
+      try{
+        await sbClient.storage.from("reports").upload(pdfFilename,pdfBlob,{contentType:"application/pdf",upsert:true});
+        const{data:urlData}=sbClient.storage.from("reports").getPublicUrl(pdfFilename);
+        pdfPublicUrl=urlData?.publicUrl||"";
+      }catch(uploadErr){
+        console.warn("PDF upload to storage failed:",uploadErr);
+      }
+
+      // Share the report record + message
       await apiCall("post",`${API}/consult/share-report`,{
-        consultation_id:sel, physio_id:c?.physio_id,
-        features:camState?.features||{}, result:camState?.score||{}, risk:camState?.risk||{},
-        snapshot_urls:snapshots.map(s=>s.url||s.storage_url||`${API}/snapshots/view/${s.filename||s.name}`).filter(Boolean),
-        snapshot_names:snapshots.map(s=>s.filename||s.name).filter(Boolean),
+        consultation_id : sel,
+        physio_id       : c?.physio_id,
+        features        : camState?.features||{},
+        result          : camState?.score||{},
+        risk            : camState?.risk||{},
+        snapshot_urls   : snapshots.map(s=>s.url||s.storage_url||`${API}/snapshots/view/${s.filename||s.name}`).filter(Boolean),
+        snapshot_names  : snapPaths.map(p=>p.split("/").pop()),
+        pdf_filename    : pdfFilename,
+        pdf_url         : pdfPublicUrl,
+        patient_name    : patientName||"Patient",
+        report_date     : today,
       });
-      setStatus("✅ Report shared with physiotherapist!");
-    }catch(e){setStatus("❌ "+(e.response?.data?.detail||"Failed"));}
+
+      // Also auto-download for patient
+      const url=URL.createObjectURL(pdfBlob);
+      const a=document.createElement("a");
+      a.href=url; a.download=pdfFilename;
+      document.body.appendChild(a); a.click(); a.remove();
+
+      setStatus(`✅ Report shared & saved as ${pdfFilename}`);
+    }catch(e){setStatus("❌ "+(e.response?.data?.detail||e.message||"Failed"));}
     setSharing(false);
   };
+
+  // Ordered snapshot previews
+  const previewSnaps=(()=>{
+    const SIDE_ORDER=["FRONT","LEFT_SIDE","LEFT","RIGHT_SIDE","RIGHT"];
+    return [...snapshots].sort((a,b)=>{
+      const nA=(a.filename||a.name||"").toUpperCase();
+      const nB=(b.filename||b.name||"").toUpperCase();
+      const iA=SIDE_ORDER.findIndex(k=>nA.includes(k));
+      const iB=SIDE_ORDER.findIndex(k=>nB.includes(k));
+      return (iA===-1?99:iA)-(iB===-1?99:iB);
+    }).slice(0,3);
+  })();
+
   return (
     <div style={{ ...S.card,borderColor:"rgba(0,255,157,0.25)",marginTop:"8px" }}>
       <div style={S.cardTitle}>📊 Share Report with Physiotherapist</div>
@@ -462,6 +575,14 @@ function ShareReportPanel({ camState, consultations, snapshots }) {
               <option value="">-- Select Physiotherapist --</option>
               {all.map((c,i)=><option key={i} value={c.id}>Dr. {c.profiles?.name||"Physiotherapist"} ({c.status})</option>)}
             </select>
+
+            {/* PDF filename preview */}
+            {sel&&(
+              <div style={{ padding:"8px 12px",marginBottom:"12px",background:"rgba(56,189,248,0.05)",border:"1px solid rgba(56,189,248,0.2)",borderRadius:"8px",fontSize:"12px",color:"#38bdf8" }}>
+                📄 Will save as: <strong>{(patientName||"Patient").replace(/[^a-zA-Z0-9]/g,"_")}_{new Date().toISOString().slice(0,10)}.pdf</strong>
+              </div>
+            )}
+
             {camState?.score&&(
               <div style={{ padding:"10px",background:"rgba(0,255,157,0.05)",border:"1px solid rgba(0,255,157,0.15)",borderRadius:"8px",marginBottom:"12px" }}>
                 <div style={{ display:"flex",gap:"20px" }}>
@@ -471,13 +592,25 @@ function ShareReportPanel({ camState, consultations, snapshots }) {
                 </div>
               </div>
             )}
-            {snapshots.length>0&&(
+
+            {previewSnaps.length>0&&(
               <div style={{ display:"flex",gap:"6px",marginBottom:"12px" }}>
-                {snapshots.slice(0,3).map((s,i)=>{ const url=s.url||s.storage_url||`${API}/snapshots/view/${s.filename||s.name}`; return <img key={i} src={url} alt="" onError={e=>{e.target.style.display="none";}} style={{ width:"65px",height:"50px",objectFit:"cover",borderRadius:"4px",border:"1px solid rgba(0,255,157,0.3)" }}/>; })}
+                {previewSnaps.map((s,i)=>{
+                  const url=s.url||s.storage_url||`${API}/snapshots/view/${s.filename||s.name}`;
+                  const rawName=(s.filename||s.name||"").toUpperCase();
+                  const label=rawName.includes("FRONT")?"Front":rawName.includes("LEFT")?"Left":rawName.includes("RIGHT")?"Right":`#${i+1}`;
+                  return (
+                    <div key={i} style={{ textAlign:"center" }}>
+                      <img src={url} alt={label} onError={e=>{e.target.style.display="none";}} style={{ width:"65px",height:"50px",objectFit:"cover",borderRadius:"4px",border:"1px solid rgba(0,255,157,0.3)",display:"block" }}/>
+                      <div style={{ fontSize:"9px",color:"#475569",marginTop:"3px" }}>{label}</div>
+                    </div>
+                  );
+                })}
               </div>
             )}
+
             <button onClick={share} disabled={sharing} style={{ ...S.btn,width:"100%",padding:"12px",background:sharing?"rgba(100,100,100,0.15)":"rgba(0,255,157,0.15)",color:"#00ff9d",border:"1px solid rgba(0,255,157,0.4)",fontSize:"14px",fontWeight:"700" }}>
-              {sharing?"Sharing...":"📊 Share Report & Snapshots"}
+              {sharing?"⏳ Generating & Sharing PDF...":"📊 Share PDF Report with Physiotherapist"}
             </button>
             {status&&<p style={{ marginTop:"8px",fontSize:"13px",color:status.includes("✅")?"#00ff9d":"#f87171",textAlign:"center" }}>{status}</p>}
           </>
@@ -872,7 +1005,9 @@ function ChatWindow({ consultation, user, onBack, camState, snapshots }) {
     try{ const r=await apiCall("get",`${API}/consult/reports/${consultation.id}`); setReports(r.data.reports||[]); }catch{}
   },[consultation.id]);
 
-  useEffect(()=>{ load();loadReports(); const i=setInterval(load,4000); return()=>clearInterval(i); },[load]);
+  useEffect(()=>{ load();loadReports(); const i=setInterval(load,4000); return()=>clearInterval(i); 
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  },[load]);
 
   const send=async()=>{
     if(!txt.trim()||sending) return;
@@ -980,7 +1115,18 @@ export default function App() {
   useEffect(()=>{ if(isPhysio) setTab("patients"); else setTab("live"); },[isPhysio]);
 
   const loadAll=useCallback(async()=>{ try{ const [s,h,t]=await Promise.all([axios.get(`${API}/risk/stats`),axios.get(`${API}/risk/history?limit=50`),axios.get(`${API}/risk/trend`)]); setStats(s.data);setHistory(h.data.sessions||[]);setTrend(t.data);setApiOk(true); }catch{setApiOk(false);} },[]);
-  const loadConsultations=useCallback(async()=>{ try{ const r=await apiCall("get",`${API}/consult/my-consultations`); setConsultations(r.data.consultations||[]); }catch{} },[]);
+  const loadConsultations=useCallback(async()=>{
+    try{
+      const r=await apiCall("get",`${API}/consult/my-consultations`);
+      setConsultations(r.data.consultations||[]);
+    }catch(e){
+      // Silently ignore 401 during background polling — token refresh
+      // is handled inside apiCall; other errors log to console only
+      if(e?.response?.status!==401){
+        console.warn("loadConsultations error:",e?.message);
+      }
+    }
+  },[]);
   const loadPhysios=useCallback(async()=>{ try{ const r=await axios.get(`${API}/consult/physiotherapists`); setPhysios(r.data.physiotherapists||[]); }catch{} },[]);
   const loadPrescriptions=useCallback(async()=>{ try{ const r=await apiCall("get",`${API}/consult/prescriptions`); setPrescriptions(r.data.prescriptions||[]); }catch{} },[]);
   const loadDailyProgress=useCallback(async()=>{ try{ const r=await apiCall("get",`${API}/consult/my-daily-progress`); setDailyProgress(r.data.tracking||[]); }catch{} },[]);
@@ -1006,25 +1152,55 @@ export default function App() {
     setAiLoading(false);
   };
 
+  const demoRef=useRef(demo);
   useEffect(()=>{
     if(!user) return;
+    const d=demoRef.current;
     loadAll();loadPhysios();loadConsultations();loadSnapshots();loadPrescriptions();
     if(!isPhysio) loadDailyProgress();
-    axios.post(`${API}/risk/as-risk`,demo).then(r=>setAsRisk(r.data)).catch(()=>{});
-    axios.post(`${API}/posture/explain`,demo).then(r=>setShap(r.data.explanation)).catch(()=>{});
-    axios.post(`${API}/posture/predict`,demo).then(r=>setMlResult(r.data)).catch(()=>{});
-    axios.get(`${API}/report/exercises?features=${encodeURIComponent(JSON.stringify(demo))}`).then(r=>setExercises(r.data.exercises||[])).catch(()=>{});
+    axios.post(`${API}/risk/as-risk`,d).then(r=>setAsRisk(r.data)).catch(()=>{});
+    axios.post(`${API}/posture/explain`,d).then(r=>setShap(r.data.explanation)).catch(()=>{});
+    axios.post(`${API}/posture/predict`,d).then(r=>setMlResult(r.data)).catch(()=>{});
+    axios.get(`${API}/report/exercises?features=${encodeURIComponent(JSON.stringify(d))}`).then(r=>setExercises(r.data.exercises||[])).catch(()=>{});
     const i1=setInterval(loadAll,10000);
     const i2=setInterval(async()=>{ try{ const r=await axios.get(`${API}/camera/state`); setCamState(r.data); if(r.data.capture_done&&!captureComplete){setCaptureComplete(true);setTimeout(()=>{loadSnapshots();},3000);} }catch{} },1500);
-    const i3=setInterval(()=>{ if(localStorage.getItem("token")) loadConsultations(); },5000);
+    const i3=setInterval(async()=>{
+      const t=localStorage.getItem("token");
+      if(!t) return;
+      // Re-validate session before polling to avoid flooding 401s
+      try{
+        const{data}=await sb.auth.getSession();
+        if(data?.session?.access_token){
+          localStorage.setItem("token",data.session.access_token);
+          loadConsultations();
+        }
+      }catch{ loadConsultations(); } // fallback — just try anyway
+    },8000); // increased from 5s to 8s to reduce request flood
     const i4=setInterval(loadSnapshots,20000);
     return()=>{clearInterval(i1);clearInterval(i2);clearInterval(i3);clearInterval(i4);};
-  },[user]);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  },[user,isPhysio,loadAll,loadConsultations,loadDailyProgress,loadPhysios,loadPrescriptions,loadSnapshots]);
 
   const handleLogin=d=>{setUser(d);localStorage.setItem("role",d.role);};
   const handleLogout=async()=>{stopCamera();await sb.auth.signOut();localStorage.clear();setUser(null);};
-
-  const downloadPDF=async()=>{ setPdfLoading(true); try{ const snapPaths=snapshots.slice(0,3).map(s=>`data/${s.filename||s.name}`).filter(Boolean); const res=await axios.post(`${API}/report/generate-pdf`,{features:camState?.features||demo,result:camState?.score||{},risk:camState?.risk||{},snapshot_paths:snapPaths},{responseType:"blob"}); const url=URL.createObjectURL(new Blob([res.data])); const a=document.createElement("a");a.href=url;a.download="posture_report.pdf";document.body.appendChild(a);a.click();a.remove(); }catch{alert("PDF failed.");} setPdfLoading(false); };
+  const getSnapshotsInCaptureOrder = () => {
+    const SIDE_ORDER = ["FRONT", "LEFT_SIDE", "LEFT", "RIGHT_SIDE", "RIGHT"];
+    if (camState?.snapshot_urls?.length) {
+      return camState.snapshot_urls
+        .slice(0, 3)
+        .map(s => s.filename ? `data/${s.filename}` : "")
+        .filter(Boolean);
+  }
+  const sorted = [...snapshots].sort((a, b) => {
+    const nameA = (a.filename || a.name || "").toUpperCase();
+    const nameB = (b.filename || b.name || "").toUpperCase();
+    const idxA  = SIDE_ORDER.findIndex(k => nameA.includes(k));
+    const idxB  = SIDE_ORDER.findIndex(k => nameB.includes(k));
+    return (idxA === -1 ? 99 : idxA) - (idxB === -1 ? 99 : idxB);
+  });
+  return sorted.slice(0, 3).map(s => `data/${s.filename || s.name}`).filter(Boolean);
+};
+  const downloadPDF=async()=>{ setPdfLoading(true); try{ const snapPaths=getSnapshotsInCaptureOrder(); const res=await axios.post(`${API}/report/generate-pdf`,{features:camState?.features||demo,result:camState?.score||{},risk:camState?.risk||{},snapshot_paths:snapPaths},{responseType:"blob"}); const url=URL.createObjectURL(new Blob([res.data])); const a=document.createElement("a");a.href=url;a.download="posture_report.pdf";document.body.appendChild(a);a.click();a.remove(); }catch{alert("PDF failed.");} setPdfLoading(false); };
 
   const shareWhatsApp=async()=>{ await downloadPDF(); const score=camState?.score?.score||0,risk=camState?.risk?.risk_score||0,cls=camState?.score?.classification||"N/A"; const text=["PostureAI Health Report 📊","",`✅ Score: ${score}/100`,`⚠️ Risk: ${risk}/100`,`📋 Class: ${cls}`,`📸 ${snapshots.length} snapshots captured`,"","PDF saved to device — please attach it.","Generated by PostureAI"].join("%0A"); window.open(`https://wa.me/?text=${text}`,"_blank"); };
 
@@ -1040,7 +1216,6 @@ export default function App() {
   const chartData=history.slice(-20).map((h,i)=>({name:`#${i+1}`,score:parseFloat(h.posture_score)||0}));
   const shapData=(shap||[]).map(s=>({feature:s.feature,impact:parseFloat((s.shap_value||0).toFixed(3))}));
   const asData=(asRisk?.progression||[]).map(p=>({year:p.year,"No Correction":p.no_intervention,"With Exercises":p.with_intervention}));
-  const classData=stats?[{name:"Good",value:stats.classifications?.GOOD||0},{name:"Warning",value:stats.classifications?.WARNING||0},{name:"Bad",value:stats.classifications?.BAD||0}]:[];
   const liveScore=camState?.score?.score||0,liveRisk=camState?.risk?.risk_score||0,liveClass=camState?.score?.classification||"—";
 
   const tabs=isPhysio?[
@@ -1428,7 +1603,7 @@ export default function App() {
                 </div>
               ))}
               {/* Share report */}
-              <ShareReportPanel camState={camState} consultations={consultations} snapshots={snapshots}/>
+              <ShareReportPanel camState={camState} consultations={consultations} snapshots={snapshots} patientName={user?.name||localStorage.getItem("name")||"Patient"}/>
             </div>
           )}
 
@@ -1502,7 +1677,7 @@ export default function App() {
             <div style={{ ...S.card,marginBottom:"16px" }}>
               <div style={S.cardTitle}>Captured Snapshots</div>
               <div style={{ display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:"10px" }}>
-                {snapshots.slice(0,3).map((snap,i)=>{ const url=snap.url||snap.storage_url||`${API}/snapshots/view/${snap.filename||snap.name}`; const sides=["Front","Left Side","Right Side"]; return (<div key={i}><BigImage src={url} fallbackSrc={`${API}/snapshots/view/${snap.filename||snap.name}`} label={sides[i]}/><div style={{ fontSize:"11px",color:"#475569",textAlign:"center",marginTop:"4px" }}>{sides[i]}</div></div>); })}
+                {(()=>{ const SIDE_ORDER=["FRONT","LEFT_SIDE","LEFT","RIGHT_SIDE","RIGHT"]; const orderedSnaps=[...snapshots].sort((a,b)=>{ const nA=(a.filename||a.name||"").toUpperCase(); const nB=(b.filename||b.name||"").toUpperCase(); const iA=SIDE_ORDER.findIndex(k=>nA.includes(k)); const iB=SIDE_ORDER.findIndex(k=>nB.includes(k)); return (iA===-1?99:iA)-(iB===-1?99:iB); }); return orderedSnaps.slice(0,3).map((snap,i)=>{ const url=snap.url||snap.storage_url||`${API}/snapshots/view/${snap.filename||snap.name}`; const rawName=(snap.filename||snap.name||"").toUpperCase(); const label=rawName.includes("FRONT")?"Front":rawName.includes("LEFT_SIDE")?"Left Side":rawName.includes("LEFT")?"Left Side":rawName.includes("RIGHT_SIDE")?"Right Side":rawName.includes("RIGHT")?"Right Side":`Snapshot ${i+1}`; return (<div key={i}><BigImage src={url} fallbackSrc={`${API}/snapshots/view/${snap.filename||snap.name}`} label={label}/><div style={{ fontSize:"11px",color:"#475569",textAlign:"center",marginTop:"4px" }}>{label}</div></div>); }); })()}
               </div>
             </div>
           )}

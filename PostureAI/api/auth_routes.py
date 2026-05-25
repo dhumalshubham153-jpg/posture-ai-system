@@ -93,14 +93,16 @@ async def login(data: LoginData):
             sb_admin = get_admin_client()
             profile  = sb_admin.table("profiles").select("*").eq("id", str(res.user.id)).single().execute()
             role     = profile.data.get("role", "user") if profile.data else "user"
+            name     = profile.data.get("name", "") if profile.data else res.user.user_metadata.get("name", "")
 
             return {
-                "success"     : True,
-                "access_token": res.session.access_token,
-                "user_id"     : str(res.user.id),
-                "email"       : res.user.email,
-                "name"        : res.user.user_metadata.get("name", ""),
-                "role"        : role,
+                "success"      : True,
+                "access_token" : res.session.access_token,
+                "refresh_token": res.session.refresh_token,  # send refresh token too
+                "user_id"      : str(res.user.id),
+                "email"        : res.user.email,
+                "name"         : name,
+                "role"         : role,
             }
         raise HTTPException(status_code=401, detail="Invalid credentials")
     except Exception as e:

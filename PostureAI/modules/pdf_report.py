@@ -7,17 +7,46 @@ from reportlab.lib.units import mm
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, HRFlowable, Image
 from reportlab.lib.enums import TA_CENTER
 
+# Canonical side labels — derived from filename keywords.
+# Order here matches CAPTURE_SEQUENCE in api/main.py.
+_SIDE_KEYWORDS = [
+    ("FRONT",      "FRONT"),
+    ("LEFT_SIDE",  "LEFT SIDE"),
+    ("RIGHT_SIDE", "RIGHT SIDE"),
+    ("LEFT",       "LEFT SIDE"),   # fallback for older filenames
+    ("RIGHT",      "RIGHT SIDE"),  # fallback for older filenames
+]
+
+
+def _label_from_filename(path: str, fallback: str) -> str:
+    """
+    Derive a human-readable side label from the snapshot filename.
+    e.g. "data/snapshot_20260525_083000_FRONT.jpg"  →  "FRONT"
+         "data/snapshot_20260525_083000_LEFT_SIDE.jpg" →  "LEFT SIDE"
+    Falls back to the provided string if no keyword matches.
+    """
+    basename = os.path.basename(path).upper()
+    for keyword, label in _SIDE_KEYWORDS:
+        if keyword in basename:
+            return label
+    return fallback
+
+
 class PDFReportGenerator:
 
     def __init__(self):
         os.makedirs('reports', exist_ok=True)
 
     def generate(self, features, result, risk, recommendations,
-                 as_risk=None, filepath=None, snapshot_paths=None):
+                 as_risk=None, filepath=None, snapshot_paths=None,
+                 patient_name=None, report_date=None):
 
+        today     = report_date or datetime.now().strftime('%Y-%m-%d')
         if filepath is None:
-            ts       = datetime.now().strftime('%Y%m%d_%H%M%S')
-            filepath = f'reports/posture_report_{ts}.pdf'
+            safe_name = (patient_name or "Patient").replace(" ", "_")
+            # Remove any characters that are unsafe in filenames
+            safe_name = "".join(c for c in safe_name if c.isalnum() or c == "_")
+            filepath  = f'reports/{safe_name}_{today}.pdf'
 
         doc   = SimpleDocTemplate(filepath, pagesize=A4,
                                   leftMargin=20*mm, rightMargin=20*mm,
@@ -36,7 +65,10 @@ class PDFReportGenerator:
 
         # ── Header ─────────────────────────────────────────────────────────
         story.append(Paragraph("PostureAI Report", title_style))
-        story.append(Paragraph(f"Generated: {datetime.now().strftime('%B %d, %Y %H:%M')}", normal))
+        display_name = patient_name or "Patient"
+        display_date = datetime.strptime(today, '%Y-%m-%d').strftime('%B %d, %Y') if report_date else datetime.now().strftime('%B %d, %Y %H:%M')
+        story.append(Paragraph(f"Patient: {display_name}", normal))
+        story.append(Paragraph(f"Generated: {display_date}", normal))
         story.append(HRFlowable(width="100%", thickness=1,
                                 color=colors.HexColor('#00c97a'), spaceAfter=10))
 
@@ -47,36 +79,37 @@ class PDFReportGenerator:
                 story.append(Paragraph("Captured Posture Snapshots", h2_style))
                 story.append(Spacer(1, 4))
 
-                # Show up to 3 snapshots side by side
                 img_data = []
                 labels   = []
-                sides    = ["FRONT", "LEFT SIDE", "RIGHT SIDE"]
 
+                # FIX: derive the label from the *filename* rather than the
+                # array index so the label is always correct regardless of
+                # the order in which snapshot_paths was constructed.
                 for i, snap_path in enumerate(valid_snaps[:3]):
+                    fallback = f"Snapshot {i + 1}"
+                    side_label = _label_from_filename(snap_path, fallback)
                     try:
                         img = Image(snap_path, width=55*mm, height=45*mm)
                         img_data.append(img)
-                        side = sides[i] if i < len(sides) else f"Snapshot {i+1}"
-                        labels.append(Paragraph(side, center))
+                        labels.append(Paragraph(side_label, center))
                     except Exception as e:
-                        print(f"Snapshot error: {e}")
+                        print(f"Snapshot error ({snap_path}): {e}")
 
                 if img_data:
-                    # Images row
-                    img_table = Table([img_data], colWidths=[60*mm]*len(img_data))
+                    col_w = 60 * mm
+                    img_table = Table([img_data], colWidths=[col_w] * len(img_data))
                     img_table.setStyle(TableStyle([
-                        ('ALIGN',   (0,0), (-1,-1), 'CENTER'),
-                        ('VALIGN',  (0,0), (-1,-1), 'MIDDLE'),
-                        ('PADDING', (0,0), (-1,-1), 4),
+                        ('ALIGN',   (0, 0), (-1, -1), 'CENTER'),
+                        ('VALIGN',  (0, 0), (-1, -1), 'MIDDLE'),
+                        ('PADDING', (0, 0), (-1, -1), 4),
                     ]))
                     story.append(img_table)
 
-                    # Labels row
-                    label_table = Table([labels], colWidths=[60*mm]*len(labels))
+                    label_table = Table([labels], colWidths=[col_w] * len(labels))
                     label_table.setStyle(TableStyle([
-                        ('ALIGN',   (0,0), (-1,-1), 'CENTER'),
-                        ('FONTSIZE',(0,0), (-1,-1), 9),
-                        ('TEXTCOLOR',(0,0),(-1,-1), colors.HexColor('#475569')),
+                        ('ALIGN',     (0, 0), (-1, -1), 'CENTER'),
+                        ('FONTSIZE',  (0, 0), (-1, -1), 9),
+                        ('TEXTCOLOR', (0, 0), (-1, -1), colors.HexColor('#475569')),
                     ]))
                     story.append(label_table)
                     story.append(Spacer(1, 8))
@@ -85,7 +118,6 @@ class PDFReportGenerator:
         if result:
             story.append(Paragraph("Posture Score Summary", h2_style))
             score = result.get('score', 0)
-            clr   = '#00c97a' if score >= 75 else '#f59e0b' if score >= 50 else '#ef4444'
 
             score_data = [
                 ['Metric',          'Value'],
@@ -98,14 +130,14 @@ class PDFReportGenerator:
 
             t = Table(score_data, colWidths=[80*mm, 80*mm])
             t.setStyle(TableStyle([
-                ('BACKGROUND',    (0,0), (-1,0), colors.HexColor('#0f172a')),
-                ('TEXTCOLOR',     (0,0), (-1,0), colors.HexColor('#00c97a')),
-                ('FONTSIZE',      (0,0), (-1,-1), 10),
-                ('FONTNAME',      (0,0), (-1,0), 'Helvetica-Bold'),
-                ('ROWBACKGROUNDS',(0,1), (-1,-1),
+                ('BACKGROUND',    (0, 0), (-1, 0), colors.HexColor('#0f172a')),
+                ('TEXTCOLOR',     (0, 0), (-1, 0), colors.HexColor('#00c97a')),
+                ('FONTSIZE',      (0, 0), (-1, -1), 10),
+                ('FONTNAME',      (0, 0), (-1, 0), 'Helvetica-Bold'),
+                ('ROWBACKGROUNDS',(0, 1), (-1, -1),
                  [colors.HexColor('#f8fafc'), colors.HexColor('#f1f5f9')]),
-                ('GRID',          (0,0), (-1,-1), 0.5, colors.HexColor('#e2e8f0')),
-                ('PADDING',       (0,0), (-1,-1), 8),
+                ('GRID',          (0, 0), (-1, -1), 0.5, colors.HexColor('#e2e8f0')),
+                ('PADDING',       (0, 0), (-1, -1), 8),
             ]))
             story.append(t)
 
@@ -134,14 +166,14 @@ class PDFReportGenerator:
 
             ft = Table(feat_data, colWidths=[70*mm, 50*mm, 50*mm])
             ft.setStyle(TableStyle([
-                ('BACKGROUND',    (0,0), (-1,0), colors.HexColor('#0f172a')),
-                ('TEXTCOLOR',     (0,0), (-1,0), colors.HexColor('#00c97a')),
-                ('FONTNAME',      (0,0), (-1,0), 'Helvetica-Bold'),
-                ('FONTSIZE',      (0,0), (-1,-1), 10),
-                ('ROWBACKGROUNDS',(0,1), (-1,-1),
+                ('BACKGROUND',    (0, 0), (-1, 0), colors.HexColor('#0f172a')),
+                ('TEXTCOLOR',     (0, 0), (-1, 0), colors.HexColor('#00c97a')),
+                ('FONTNAME',      (0, 0), (-1, 0), 'Helvetica-Bold'),
+                ('FONTSIZE',      (0, 0), (-1, -1), 10),
+                ('ROWBACKGROUNDS',(0, 1), (-1, -1),
                  [colors.HexColor('#f8fafc'), colors.HexColor('#f1f5f9')]),
-                ('GRID',          (0,0), (-1,-1), 0.5, colors.HexColor('#e2e8f0')),
-                ('PADDING',       (0,0), (-1,-1), 7),
+                ('GRID',          (0, 0), (-1, -1), 0.5, colors.HexColor('#e2e8f0')),
+                ('PADDING',       (0, 0), (-1, -1), 7),
             ]))
             story.append(ft)
 
@@ -160,14 +192,14 @@ class PDFReportGenerator:
 
             et = Table(ex_data, colWidths=[50*mm, 50*mm, 20*mm, 20*mm, 25*mm])
             et.setStyle(TableStyle([
-                ('BACKGROUND',    (0,0), (-1,0), colors.HexColor('#0f172a')),
-                ('TEXTCOLOR',     (0,0), (-1,0), colors.HexColor('#00c97a')),
-                ('FONTNAME',      (0,0), (-1,0), 'Helvetica-Bold'),
-                ('FONTSIZE',      (0,0), (-1,-1), 9),
-                ('ROWBACKGROUNDS',(0,1), (-1,-1),
+                ('BACKGROUND',    (0, 0), (-1, 0), colors.HexColor('#0f172a')),
+                ('TEXTCOLOR',     (0, 0), (-1, 0), colors.HexColor('#00c97a')),
+                ('FONTNAME',      (0, 0), (-1, 0), 'Helvetica-Bold'),
+                ('FONTSIZE',      (0, 0), (-1, -1), 9),
+                ('ROWBACKGROUNDS',(0, 1), (-1, -1),
                  [colors.HexColor('#f8fafc'), colors.HexColor('#f1f5f9')]),
-                ('GRID',          (0,0), (-1,-1), 0.5, colors.HexColor('#e2e8f0')),
-                ('PADDING',       (0,0), (-1,-1), 7),
+                ('GRID',          (0, 0), (-1, -1), 0.5, colors.HexColor('#e2e8f0')),
+                ('PADDING',       (0, 0), (-1, -1), 7),
             ]))
             story.append(et)
 

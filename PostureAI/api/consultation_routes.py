@@ -34,7 +34,18 @@ def get_user(authorization: str) -> _UserObj:
 
     # Structural check — catch corrupted/empty tokens immediately
     if not token or token.count(".") != 2:
-        raise HTTPException(status_code=401, detail="Malformed token — please login again")
+        raise HTTPException(
+            status_code=401,
+            detail="Malformed token — please logout and login again"
+        )
+
+    # Check token is not obviously empty after stripping
+    parts = token.split(".")
+    if any(len(p) < 4 for p in parts):
+        raise HTTPException(
+            status_code=401,
+            detail="Incomplete token — please logout and login again"
+        )
 
     # ── Path 1: local JWT verification (fast, no network, no timeout) ─────────
     if _JWT_AVAILABLE and SUPABASE_JWT_SECRET != "your-supabase-jwt-secret-here":
@@ -262,6 +273,11 @@ async def get_messages(consultation_id: str, authorization: str = Header(None)):
 async def share_report(data: dict, authorization: str = Header(None)):
     user = get_user(authorization)
     sb   = get_admin_client()
+    pdf_filename = data.get("pdf_filename", "")
+    pdf_url      = data.get("pdf_url", "")
+    patient_name = data.get("patient_name", "Patient")
+    report_date  = data.get("report_date", "")
+
     report = sb.table("shared_reports").insert({
         "consultation_id": data.get("consultation_id"),
         "user_id"        : str(user.id),
@@ -273,6 +289,10 @@ async def share_report(data: dict, authorization: str = Header(None)):
         "features"       : data.get("features", {}),
         "recommendations": data.get("recommendations", []),
         "as_risk"        : data.get("as_risk", {}),
+        "pdf_filename"   : pdf_filename,
+        "pdf_url"        : pdf_url,
+        "patient_name"   : patient_name,
+        "report_date"    : report_date,
         "status"         : "pending",
     }).execute()
     cid    = data.get("consultation_id")
@@ -282,6 +302,8 @@ async def share_report(data: dict, authorization: str = Header(None)):
         msg = f"📊 Shared posture report — Score: {result.get('score',0)}/100 | Risk: {data.get('risk',{}).get('severity','N/A')}"
         if snaps:
             msg += f" | {len(snaps)} snapshot(s) attached"
+        if pdf_filename:
+            msg += f" | 📄 PDF: {pdf_filename}"
         sb.table("messages").insert({
             "consultation_id": cid,
             "sender_id"      : str(user.id),
